@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+
+set -e -o pipefail
+
+# Name of the utility
+readonly SELF=$(basename $0)
+
+# Color variables
+readonly GREEN='\033[0;32m'
+readonly RED='\033[0;31m'
+readonly YELLOW='\033[1;33m'
+readonly NC='\033[0m' # No Color
+
+# Spacing variables
+readonly TAB='  '
+readonly TABx2='    '
+
+# Script input variables
+COMMAND="" # The command to run
+CREDS="" # The full path to a Cloud SQL service account crednetials JSON file
+FLAVOR="postgres" # The "flavor" of database to start
+INSTANCE_NAME="" # The full connection name of the Cloud SQL instance to proxy connections to
+
+# Script readonly variables
+readonly DOCKER_IMAGE="gcr.io/cloudsql-docker/gce-proxy"
+readonly DOCKER_IMAGE_VERSION="1.11"
+
+# Script variables
+CONTAINER_NAME="cloudsql-proxy" # The name of the container
+PORT="" # The port of the proxy
+
+########### Command Functions ###########
+
+# Function that starts the service's container when possible
+start() {
+  # Check if container is already running
+  [ "$(container_status)" == "running" ] && die "Cloud SQL proxy is already running."
+
+  # Check if container image needs to be pulled
+  if ! image_exists; then
+      echo_yellow "Cloud SQL proxy docker image not found.  Pulling..."
+      pull_latest_image
+  fi
+
+  echo_yellow "Starting container..."
+  if [ "$(container_status)" == "not found" ]; then
+      docker_command
+  else
+      docker start $CONTAINER_NAME 1> /dev/null
+  fi
+
+  echo_green "Cloud SQL proxy docker container started successfully!"
+}
+
+# Function that stops the service's container if it's running
+stop() {
+  # Check that container is already running
+  [ "$(container_status)" != "running" ] && die "Cloud SQL proxy is not running."
+
+  # Stop the container
+  echo_yellow "Stopping container..."
+  docker rm -f $CONTAINER_NAME 1> /dev/null
+
+  echo_green "Cloud SQL proxy docker container stopped successfully!"
+}
+
+# Function that first stops then starts the service's container
+restart() {
+  stop
+  start
+}
+
+# Function that updates the container's image to the latest version
+update() {
+  echo_yellow "Pulling latest docker image..."
+  pull_latest_image
+}
+
+status() {
+      cat <<EOF
+
+Docker:     running
+Image:      $(image_exists && echo 'downloaded')$(image_exists || echo 'not found')
+Container:  $(container_status)
+
+EOF
+}
+
+########### Docker Functions ###########
+
+# Returns the status of the container
+container_status() {
+    docker inspect --format='{{.State.Status}}' $CONTAINER_NAME 2> /dev/null | sed '/^$/d' || echo 'not found'
+}
+
+# Function that starts the service's container
+docker_command() {
+  docker run -d --restart=always \
+    -v /tmp:/cloudsql \
+    -v "${CREDS}:/config" \
+    -p "127.0.0.1:${PORT}:${PORT}" \
+    --name "${CONTAINER_NAME}" \
+    "${DOCKER_IMAGE}:${DOCKER_IMAGE_VERSION}" \
+    /cloud_sql_proxy -instances="${INSTANCE_NAME}=tcp:0.0.0.0:${PORT}" -credential_file=/config
+}
+
+# Function that pulls the latest version of the container's image
+pull_latest_image() {
+    docker pull "${DOCKER_IMAGE}:${DOCKER_IMAGE_VERSION}"
+}
+
+########### State Checker Functions ###########
+
+# Returns true if docker is running, false otherwise
+docker_is_running() {
+    docker info &> /dev/null
+}
+
+# Returns true if container image exists, false otherwise
+image_exists() {
+    [ "$(docker images ${DOCKER_IMAGE} | wc -l)" -eq "2" ]
+}
+
+########### Script Utility Functions ###########
+
+# Function used to set the port of the proxy based on the "flavor" of the proxy
+set_port_by_flavor() {
+  if [[ "${FLAVOR}" == "mysql" ]]; then
+    PORT="3306"
+  else
+    PORT="5432"
+  fi
+}
+
+# Function that outputs usage information
+usage() {
+  cat <<EOF
+
+Usage: $BIN_ROOT/$(basename $0) <options> [command]
+
+Script used to control a Cloud SQL proxy docker container
+
+Options:
+  -c (required)     The full path to a Cloud SQL service account crednetials JSON file
+  -f                The "flavor" of database to start
+                    NOTE: May be either "postgres" (default) or "mysql"
+  -i (required)     The full connection name of the Cloud SQL instance to proxy connections to
+  -h|--help         Print this message and quit
+
+Commands:
+  status      Prints the status of the Cloud SQL proxy
+  start       Starts the Cloud SQL proxy
+  stop        Stops the Cloud SQL proxy
+  restart     Restarts the Cloud SQL proxy
+  update      Pulls the latest image for the Cloud SQL proxy
+
+EOF
+  exit 0
+}
+
+# Function that verifies required input was passed in
+verify_input() {
+  # Verify required inputs are not empty
+  [ ! -z "$CREDS" ] && [ ! -z "$FLAVOR" ] && [ ! -z "$INSTANCE_NAME" ]
+}
+
+########### Echo Functions ###########
+
+# Function to handle exiting with an error
+die() {
+    echo_red >&2 "$@"
+    exit 1
+}
+
+# Function used to color echo text in green
+echo_green() {
+    echo -e "${GREEN}$@${NC}"
+}
+
+# Function used to color echo text in red
+echo_red() {
+    echo -e "${RED}$@${NC}"
+}
+
+# Function used to color echo text in yellow
+echo_yellow() {
+    echo -e "${YELLOW}$@${NC}"
+}
+
+# Parse input options
+while getopts ":c:f:i:h-:" opt; do
+  case "$opt" in
+    c) CREDS=$OPTARG;;
+    f) FLAVOR=$OPTARG;;
+    i) INSTANCE_NAME=$OPTARG;;
+    h) usage;;
+    -)
+      case "${OPTARG}" in
+        help) usage;;
+        *) usage;;
+      esac
+    ;;
+    \?) echo_red "Invalid option: -$OPTARG." && usage;;
+    :) die "Option -$OPTARG requires an argument.";;
+  esac
+done
+
+# Set port
+set_port_by_flavor
+
+# Add flavor to container name
+CONTAINER_NAME="${CONTAINER_NAME}-${FLAVOR}"
+
+# Get last argument as command
+for COMMAND; do true; done
+
+# Don't bother verifying input or outputing run info for status checks
+if [[ "${COMMAND}" == "status" ]] || [[ "${COMMAND}" == "stop" ]] || [[ "${COMMAND}" == "update" ]]; then
+  $COMMAND
+  exit 0
+fi
+
+# Verify input
+! verify_input && echo_red "Missing script options." && usage
+
+# Check for a running Docker installation
+! [ docker_is_running ] && die "Cannot connect to the Docker daemon. Is the docker daemon running on this host?"
+
+# Output run information
+echo_yellow "Executing docker-cloudsql with the following settings:"
+echo_yellow "${TAB}Credentials file: ${CREDS}"
+echo_yellow "${TAB}Cloud SQL instance connection name: ${INSTANCE_NAME}"
+echo_yellow "${TAB}Proxy flavor: ${FLAVOR}"
+echo_yellow "${TAB}Proxy port: ${PORT}"
+echo_yellow "${TAB}Container name: ${CONTAINER_NAME}"
+
+# Execute command
+$COMMAND
